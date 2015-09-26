@@ -204,8 +204,8 @@ BrotliCompressor::BrotliCompressor(BrotliParams params)
   memcpy(saved_dist_cache_, dist_cache_, sizeof(dist_cache_));
 
   // Initialize hashers.
-  hash_type_ = std::min(9, params_.quality);
-  hashers_->Init(hash_type_);
+  hash_type_ = std::min(10, params_.quality);
+  hashers_->Init(hash_type_, params_.lgwin);
 }
 
 BrotliCompressor::~BrotliCompressor() {

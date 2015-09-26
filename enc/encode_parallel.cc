@@ -168,7 +168,7 @@ bool WriteMetaBlockParallel(const BrotliParams& params,
   // Initialize hashers.
   int hash_type = std::min(9, params.quality);
   std::unique_ptr<Hashers> hashers(new Hashers());
-  hashers->Init(hash_type);
+  hashers->Init(hash_type, params.lgwin);
 
   // Compute backward references.
   int last_insert_len = 0;

@@ -617,6 +617,292 @@ class HashLongestMatch {
   size_t num_dict_matches_;
 };
 
+//
+// This is a Binary Trees (bt) based matchfinder.
+//
+// The main data structure is a hash table where each hash bucket contains a
+// binary tree of sequences whose first 4 bytes share the same hash code.  Each
+// sequence is identified by its starting position in the input data.  Each
+// binary tree is always sorted such that each left child represents a sequence
+// lexicographically lesser than its parent and each right child represents a
+// sequence lexicographically greater than its parent.
+//
+// The algorithm processes the input data sequentially.  At each byte position,
+// the hash code of the first 4 bytes of the sequence beginning at that position
+// (the sequence being matched against) is computed.  This identifies the hash
+// bucket to use for that position.  Then, a new binary tree node is created to
+// represent the current sequence.  Then, in a single tree traversal, the hash
+// bucket's binary tree is searched for matches and is re-rooted at the new
+// node.
+//
+template <int kHash2Log, int kHash3Log, int kHash4Log>
+class BT4_Matchfinder {
+public:
+
+  // Allocate the matchfinder.
+  BT4_Matchfinder(int lgwin, uint32_t max_search_depth, uint32_t nice_length)
+    : window_mask_(((uint32_t)1 << lgwin) - 1),
+      hash_tabs_(new uint32_t[kHashTotalLength]),
+      child_tab_(new uint32_t[2 * (window_mask_ + 1)]),
+      max_search_depth_(max_search_depth),
+      nice_length_(nice_length)
+  {
+    Reset();
+  }
+
+  // Free the matchfinder.
+  ~BT4_Matchfinder()
+  {
+    delete hash_tabs_;
+    delete child_tab_;
+  }
+
+  // Reset the matchfinder for a new input stream.
+  void Reset() {
+    for (uint32_t i = 0; i < kHashTotalLength; i++) {
+      hash_tabs_[i] = -window_mask_;
+    }
+  }
+
+  // Advance the matchfinder by one byte, optionally saving matches in the
+  // 'matches' array.
+  inline __attribute__((always_inline)) BackwardMatch *
+  AdvanceOneByte(const uint8_t * const __restrict data,
+                 const uint32_t cur_ix,
+                 const uint32_t ring_buffer_mask,
+                 const uint32_t max_length,
+                 BackwardMatch* __restrict matches,
+                 uint32_t * const __restrict best_len_ret,
+                 const bool record_matches) const
+  {
+    BackwardMatch *orig_matches = matches;
+    const uint8_t * const strptr = &data[cur_ix & ring_buffer_mask];
+    const uint32_t nice_len = std::min(nice_length_, max_length);
+    uint32_t depth_remaining = max_search_depth_;
+    uint32_t seq2, seq3, seq4;
+    uint32_t hash2, hash3, hash4;
+    uint32_t prev_ix;
+    uint32_t *pending_lt_ptr, *pending_gt_ptr;
+    uint32_t best_lt_len, best_gt_len;
+    uint32_t best_len = 3;
+    uint32_t len;
+
+    // TODO: there needs to be at least 'nice_length_' bytes of lookahead space
+    // for positions near the end to be inserted correctly; for now just skip
+    // them entirely
+    if (PREDICT_FALSE(max_length < nice_length_)) {
+      return matches;
+    }
+
+    seq4 = BROTLI_UNALIGNED_LOAD32(strptr);
+    seq3 = BROTLI_LOADED_U32_TO_U24(seq4);
+    seq2 = BROTLI_LOADED_U32_TO_U16(seq4);
+
+    // Length 2 match (hash bucket only)
+    hash2 = Hash(seq2, kHash2Log);
+    prev_ix = hash_tabs_[kHash2Offset + hash2];
+    hash_tabs_[kHash2Offset + hash2] = cur_ix;
+    if (record_matches &&
+        cur_ix - prev_ix <= window_mask_ - 15 &&
+        seq2 == BROTLI_UNALIGNED_LOAD16(&data[prev_ix & ring_buffer_mask]))
+    {
+      *matches++ = BackwardMatch(cur_ix - prev_ix, 2);
+    }
+
+    // Length 3 match (hash bucket only)
+    hash3 = Hash(seq3, kHash3Log);
+    prev_ix = hash_tabs_[kHash3Offset + hash3];
+    hash_tabs_[kHash3Offset + hash3] = cur_ix;
+    if (record_matches &&
+        cur_ix - prev_ix <= window_mask_ - 15 &&
+        seq3 == (BROTLI_LOADED_U32_TO_U24(BROTLI_UNALIGNED_LOAD32(
+					&data[prev_ix & ring_buffer_mask]))))
+    {
+      *matches++ = BackwardMatch(cur_ix - prev_ix, 3);
+    }
+
+    // Length 4+ matches (binary tree; the hash bucket contains the tree root)
+    hash4 = Hash(seq4, kHash4Log);
+    prev_ix = hash_tabs_[kHash4Offset + hash4];
+    hash_tabs_[kHash4Offset + hash4] = cur_ix;
+
+    pending_lt_ptr = &child_tab_[2 * (cur_ix & window_mask_) + 0];
+    pending_gt_ptr = &child_tab_[2 * (cur_ix & window_mask_) + 1];
+
+    if (cur_ix - prev_ix > window_mask_ - 15) {
+      *pending_lt_ptr = -window_mask_;
+      *pending_gt_ptr = -window_mask_;
+      *best_len_ret = best_len;
+      return matches;
+    }
+
+    best_lt_len = 0;
+    best_gt_len = 0;
+    len = 0;
+
+    // Rearrange the binary tree so that its new root is the current sequence.
+    // If 'record_matches' is true, then also save matches to the 'matches'
+    // array while descending the tree.
+    for (;;) {
+
+      const uint8_t * const matchptr = &data[prev_ix & ring_buffer_mask];
+      uint32_t * const pair = &child_tab_[2 * (prev_ix & window_mask_)];
+
+      if (matchptr[len] == strptr[len]) {
+        len++;
+        len += FindMatchLengthWithLimit(strptr + len, matchptr + len, max_length - len);
+        if (!record_matches) {
+          if (len >= nice_len) {
+            *pending_lt_ptr = pair[0];
+            *pending_gt_ptr = pair[1];
+            return matches;
+          }
+        } else {
+          if (len > best_len) {
+            best_len = len;
+            if (best_len >= nice_len) {
+              matches = orig_matches;
+              *matches++ = BackwardMatch(cur_ix - prev_ix, best_len);
+              *pending_lt_ptr = pair[0];
+              *pending_gt_ptr = pair[1];
+              *best_len_ret = best_len;
+              return matches;
+            } else {
+              *matches++ = BackwardMatch(cur_ix - prev_ix, best_len);
+            }
+          }
+        }
+      }
+
+      if (matchptr[len] < strptr[len]) {
+        *pending_lt_ptr = prev_ix;
+        pending_lt_ptr = &pair[1];
+        prev_ix = *pending_lt_ptr;
+        best_lt_len = len;
+        if (best_gt_len < len) {
+          len = best_gt_len;
+        }
+      } else {
+        *pending_gt_ptr = prev_ix;
+        pending_gt_ptr = &pair[0];
+        prev_ix = *pending_gt_ptr;
+        best_gt_len = len;
+        if (best_lt_len < len) {
+          len = best_lt_len;
+        }
+      }
+
+      if (cur_ix - prev_ix > window_mask_ - 15 || --depth_remaining == 0) {
+        *pending_lt_ptr = -window_mask_;
+        *pending_gt_ptr = -window_mask_;
+        *best_len_ret = best_len;
+        return matches;
+      }
+    }
+  }
+
+  //
+  // Retrieve a list of matches with the current sequence.
+  //
+  // Sets *num_matches to the number of matches found, and stores the found
+  // matches in matches[0] to matches[*num_matches - 1].  The matches will be
+  // sorted by strictly increasingt length and (non-strictly) increasing
+  // distance.
+  //
+  // If the longest match is nice_length or longer, returns only this longest
+  // match.
+  //
+  // Requires that at least nice_length space is available in matches.
+  //
+  void FindAllMatches(const uint8_t* data,
+                      const uint32_t cur_ix,
+                      const uint32_t ring_buffer_mask,
+                      uint32_t max_length,
+                      int* num_matches,
+                      BackwardMatch* matches) const {
+
+    BackwardMatch* const orig_matches = matches;
+    uint32_t best_len;
+
+    matches = AdvanceOneByte(data, cur_ix, ring_buffer_mask,
+                             max_length, matches, &best_len, true);
+
+    int dict_matches[kMaxDictionaryMatchLen + 1];
+    for (int i = 0; i < kMaxDictionaryMatchLen + 1; i++) {
+	    dict_matches[i] = kInvalidMatch;
+    }
+    int minlen = best_len + 1;
+    if (FindAllStaticDictionaryMatches(&data[cur_ix & ring_buffer_mask],
+                                       minlen, max_length,
+                                       &dict_matches[0])) {
+      int maxlen = std::min<int>(kMaxDictionaryMatchLen, max_length);
+      for (int l = minlen; l <= maxlen; ++l) {
+        int dict_id = dict_matches[l];
+        if (dict_id < kInvalidMatch) {
+          *matches++ = BackwardMatch(std::min(cur_ix, window_mask_ - 15) +
+                                     (dict_id >> 5) + 1, l, dict_id & 31);
+        }
+      }
+    }
+
+    *num_matches = matches - orig_matches;
+  }
+
+  // Skip a byte; don't search for matches at it.  This re-roots the appropriate
+  // binary tree at the current sequence, but it doesn't record any matches.
+  void SkipByte(const uint8_t* data,
+                const uint32_t cur_ix,
+                const uint32_t ring_buffer_mask,
+                uint32_t max_length) const {
+    uint32_t best_len;
+    AdvanceOneByte(data, cur_ix, ring_buffer_mask, max_length, NULL,
+                   &best_len, false);
+  }
+
+  uint32_t nice_length() const {
+    return nice_length_;
+  }
+
+private:
+
+  static uint32_t Hash(const uint32_t seq, int num_bits) {
+    static const uint32_t kHashMul32 = 0x1e35a7bd;
+    uint32_t h = seq * kHashMul32;
+    return h >> (32 - num_bits);
+  }
+
+
+  static const uint32_t kHash2Length = (uint32_t)1 << kHash2Log;
+  static const uint32_t kHash3Length = (uint32_t)1 << kHash3Log;
+  static const uint32_t kHash4Length = (uint32_t)1 << kHash4Log;
+  static const uint32_t kHash2Offset = 0;
+  static const uint32_t kHash3Offset = kHash2Offset + kHash2Length;
+  static const uint32_t kHash4Offset = kHash3Offset + kHash3Length;
+  static const uint32_t kHashTotalLength = kHash4Offset + kHash4Length;
+
+  // The window size minus 1
+  const uint32_t window_mask_;
+
+  // The hash tables:
+  //
+  // - subtable of length kHash2Length for finding length 2 matches
+  // - subtable of length kHash3Length for finding length 3 matches
+  // - subtable of length kHash4Length containing binary trees for finding
+  //   length 4+ matches
+  uint32_t * const hash_tabs_;
+
+  // The child node references for the binary trees.  The left and right
+  // children of the node for the sequence with position 'pos' are
+  // 'child_tab[pos * 2]' and 'child_tab[pos * 2 + 1]', respectively.
+  uint32_t * const child_tab_;
+
+  // Limit on the depth to search in the tree.  Must be >= 1.
+  const uint32_t max_search_depth_;
+
+  // Stop searching if a match of at least this length is found.
+  const uint32_t nice_length_;
+};
+
 struct Hashers {
   // For kBucketSweep == 1, enabling the dictionary lookup makes compression
   // a little faster (0.5% - 1%) and it compresses 0.15% better on small text
@@ -630,8 +916,9 @@ struct Hashers {
   typedef HashLongestMatch<15, 6, 10> H7;
   typedef HashLongestMatch<15, 7, 10> H8;
   typedef HashLongestMatch<15, 8, 16> H9;
+  typedef BT4_Matchfinder<10, 15, 17> H10;
 
-  void Init(int type) {
+  void Init(int type, int lgwin) {
     switch (type) {
       case 1: hash_h1.reset(new H1); break;
       case 2: hash_h2.reset(new H2); break;
@@ -642,6 +929,7 @@ struct Hashers {
       case 7: hash_h7.reset(new H7); break;
       case 8: hash_h8.reset(new H8); break;
       case 9: hash_h9.reset(new H9); break;
+      case 10: hash_h10.reset(new H10(lgwin, 32, 48)); break;
       default: break;
     }
   }
@@ -666,6 +954,7 @@ struct Hashers {
       case 7: WarmupHash(size, dict, hash_h7.get()); break;
       case 8: WarmupHash(size, dict, hash_h8.get()); break;
       case 9: WarmupHash(size, dict, hash_h9.get()); break;
+      case 10:  /* TODO: should use SkipByte() here */ break;
       default: break;
     }
   }
@@ -679,6 +968,7 @@ struct Hashers {
   std::unique_ptr<H7> hash_h7;
   std::unique_ptr<H8> hash_h8;
   std::unique_ptr<H9> hash_h9;
+  std::unique_ptr<H10> hash_h10;
 };
 
 }  // namespace brotli

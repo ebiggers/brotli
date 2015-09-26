@@ -636,7 +636,10 @@ void CreateBackwardReferences(size_t num_bytes,
                               int* num_literals) {
   bool zopflify = quality > 9;
   if (zopflify) {
-    Hashers::H9* hasher = hashers->hash_h9.get();
+    Hashers::H10* hasher = hashers->hash_h10.get();
+#if 0 /* TODO: this logic doesn't make sense for the bt matchfinder; we need to
+         maintain 'nice_length' bytes of lookahead instead  */
+
     if (num_bytes >= 3 && position >= 3) {
       // Prepare the hashes for three last bytes of the last write.
       // These could not be calculated before, since they require knowledge
@@ -648,30 +651,29 @@ void CreateBackwardReferences(size_t num_bytes,
       hasher->Store(&ringbuffer[(position - 1) & ringbuffer_mask],
                     position - 1);
     }
+#endif
+
+    // TODO: are inputs > 4 GiB handled correctly???
+
     std::vector<int> num_matches(num_bytes);
-    std::vector<BackwardMatch> matches(3 * num_bytes);
+    std::vector<BackwardMatch> matches(6 * num_bytes);
     size_t cur_match_pos = 0;
     for (size_t i = 0; i + 3 < num_bytes; ++i) {
-      size_t max_distance = std::min(position + i, max_backward_limit);
-      int max_length = num_bytes - i;
-      // Ensure that we have at least kMaxZopfliLen free slots.
-      if (matches.size() < cur_match_pos + kMaxZopfliLen) {
-        matches.resize(cur_match_pos + kMaxZopfliLen);
+      // Ensure that we have at least 'nice_length' free slots.
+      if (PREDICT_FALSE(matches.size() < cur_match_pos + hasher->nice_length())) {
+        matches.resize(cur_match_pos + hasher->nice_length());
       }
-      hasher->FindAllMatches(
-          ringbuffer, ringbuffer_mask,
-          position + i, max_length, max_distance,
-          &num_matches[i], &matches[cur_match_pos]);
-      hasher->Store(&ringbuffer[(position + i) & ringbuffer_mask],
-                    position + i);
+      hasher->FindAllMatches(ringbuffer, position + i,
+                             ringbuffer_mask, num_bytes - i,
+                             &num_matches[i], &matches[cur_match_pos]);
       cur_match_pos += num_matches[i];
       if (num_matches[i] == 1) {
         const int match_len = matches[cur_match_pos - 1].length();
-        if (match_len > kMaxZopfliLen) {
+        if (match_len >= hasher->nice_length()) {
           for (int j = 1; j < match_len; ++j) {
             ++i;
-            hasher->Store(
-                &ringbuffer[(position + i) & ringbuffer_mask], position + i);
+            hasher->SkipByte(ringbuffer, position + i, ringbuffer_mask,
+                             num_bytes - i);
             num_matches[i] = 0;
           }
         }
